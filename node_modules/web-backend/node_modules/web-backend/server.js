@@ -15,9 +15,10 @@
   // Configurar conexión a PostgreSQL
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    ssl: {
+      rejectUnauthorized: false, // Permitir conexiones sin verificar el certificado
+    },
   });
-
   // Middleware
   app.use(cors());
   app.use(express.json());
