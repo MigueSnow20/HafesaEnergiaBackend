@@ -4,4 +4,3 @@ npm-debug.log
 .gitignore
 database.env
 .env
-debug-*.png
