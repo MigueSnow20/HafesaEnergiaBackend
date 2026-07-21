@@ -1,9 +1,4 @@
-# fly.toml app configuration file generated for hafesaenergiabackend-l-cxig on 2025-02-06T23:18:19Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
-app = 'hafesaenergiabackend-l-cxig'
+app = 'petroxpertbackend'
 primary_region = 'cdg'
 
 [build]
