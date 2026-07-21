@@ -1,32 +1,40 @@
 import express from 'express';
-import axios from 'axios';
 import cors from 'cors';
-import * as cheerio from 'cheerio';
 import pkg from 'pg';
-const { Pool } = pkg;
+import { chromium } from 'playwright';
 import dotenv from 'dotenv';
 
-// Cargar variables de entorno desde el archivo database.env
+const { Pool } = pkg;
+
+// Cargar variables desde database.env
 dotenv.config({ path: './database.env' });
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-// Configurar conexión a PostgreSQL
+// PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false,
-  },
+    rejectUnauthorized: false
+  }
 });
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Función para parsear números españoles
+/**
+ * Convierte números españoles:
+ * 1.234,56 -> 1234.56
+ * 712,50   -> 712.50
+ */
 const parseSpanishNumber = (text) => {
-  return parseFloat(
+  if (!text || typeof text !== 'string') {
+    return Number.NaN;
+  }
+
+  return Number.parseFloat(
     text
       .trim()
       .replace(/\./g, '')
@@ -34,117 +42,365 @@ const parseSpanishNumber = (text) => {
   );
 };
 
-// Ruta para scraping del gasoil
+/**
+ * Configuración del scraping.
+ */
+const PRICE_SELECTOR = '[data-test="instrument-price-last"]';
+const CACHE_DURATION_MS = 60_000;
+
+// Una sola instancia de Chromium para toda la aplicación.
+let browserInstance = null;
+let browserLaunchPromise = null;
+
+// Caché de resultados y peticiones en curso.
+const priceCache = new Map();
+const pendingScrapes = new Map();
+
+/**
+ * Devuelve una instancia compartida de Chromium.
+ *
+ * browserLaunchPromise evita que tres llamadas simultáneas
+ * inicien tres navegadores durante el primer arranque.
+ */
+const getBrowser = async () => {
+  if (browserInstance?.isConnected()) {
+    return browserInstance;
+  }
+
+  if (!browserLaunchPromise) {
+    console.log('🚀 Iniciando Chromium compartido...');
+
+    browserLaunchPromise = chromium
+      .launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage'
+        ]
+      })
+      .then((browser) => {
+        browserInstance = browser;
+
+        browser.on('disconnected', () => {
+          console.warn('⚠️ Chromium se ha desconectado');
+          browserInstance = null;
+        });
+
+        return browser;
+      })
+      .finally(() => {
+        browserLaunchPromise = null;
+      });
+  }
+
+  return browserLaunchPromise;
+};
+
+/**
+ * Obtiene un precio desde Investing.com.
+ *
+ * El navegador se mantiene abierto. Solo se cierra el contexto
+ * utilizado por esta petición.
+ */
+const scrapeInvestingPrice = async ({ url, nombre }) => {
+  const browser = await getBrowser();
+  let context;
+
+  const startedAt = Date.now();
+
+  try {
+    console.log(`🔄 Consultando ${nombre}: ${url}`);
+
+    context = await browser.newContext({
+      locale: 'es-ES',
+      timezoneId: 'Europe/Madrid',
+      viewport: {
+        width: 1280,
+        height: 720
+      },
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+        'Chrome/138.0.0.0 Safari/537.36'
+    });
+
+    const page = await context.newPage();
+
+    // Evita descargar recursos pesados que no son necesarios
+    // para localizar el precio.
+    await page.route('**/*', async (route) => {
+      const resourceType = route.request().resourceType();
+
+      if (
+        resourceType === 'image' ||
+        resourceType === 'media' ||
+        resourceType === 'font'
+      ) {
+        return route.abort();
+      }
+
+      return route.continue();
+    });
+
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30_000
+    });
+
+    if (!response) {
+      throw new Error(`No se recibió respuesta al abrir ${url}`);
+    }
+
+    if (response.status() >= 400) {
+      throw new Error(
+        `Investing.com respondió con HTTP ${response.status()}`
+      );
+    }
+
+    const priceLocator = page.locator(PRICE_SELECTOR).first();
+
+    await priceLocator.waitFor({
+      state: 'attached',
+      timeout: 15_000
+    });
+
+    const textoLimpio = (await priceLocator.textContent())?.trim();
+
+    if (!textoLimpio) {
+      throw new Error(
+        `No se encontró el valor de ${nombre}`
+      );
+    }
+
+    const valor = parseSpanishNumber(textoLimpio);
+
+    if (!Number.isFinite(valor)) {
+      throw new Error(
+        `No se pudo convertir el valor "${textoLimpio}"`
+      );
+    }
+
+    console.log(
+      `✅ ${nombre}: ${valor} en ${Date.now() - startedAt} ms`
+    );
+
+    return {
+      valor,
+      textoOriginal: textoLimpio,
+      obtenidoEn: new Date().toISOString()
+    };
+  } finally {
+    if (context) {
+      await context.close();
+    }
+  }
+};
+
+/**
+ * Devuelve el precio desde caché o realiza el scraping.
+ *
+ * También reutiliza una petición que ya se encuentre en curso
+ * para evitar dos scrapings simultáneos del mismo producto.
+ */
+const getPrice = async ({ key, url, nombre }) => {
+  const cached = priceCache.get(key);
+
+  if (
+    cached &&
+    Date.now() - cached.timestamp < CACHE_DURATION_MS
+  ) {
+    console.log(`⚡ Caché utilizada para ${nombre}`);
+
+    return {
+      ...cached.result,
+      cached: true
+    };
+  }
+
+  if (pendingScrapes.has(key)) {
+    console.log(`⏳ Reutilizando petición en curso para ${nombre}`);
+    return pendingScrapes.get(key);
+  }
+
+  const scrapingPromise = scrapeInvestingPrice({
+    url,
+    nombre
+  })
+    .then((result) => {
+      priceCache.set(key, {
+        result,
+        timestamp: Date.now()
+      });
+
+      return {
+        ...result,
+        cached: false
+      };
+    })
+    .finally(() => {
+      pendingScrapes.delete(key);
+    });
+
+  pendingScrapes.set(key, scrapingPromise);
+
+  return scrapingPromise;
+};
+
+// Configuración centralizada de mercados.
+const MARKETS = {
+  gasoil: {
+    url: 'https://es.investing.com/commodities/london-gas-oil',
+    nombre: 'gasoil'
+  },
+  gasolina: {
+    url: 'https://es.investing.com/commodities/gasoline-rbob',
+    nombre: 'gasolina'
+  },
+  tipoCambio: {
+    url: 'https://es.investing.com/currencies/eur-usd',
+    nombre: 'tipo de cambio'
+  }
+};
+
+// Comprobación básica.
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Backend Hafesa Energía funcionando'
+  });
+});
+
+// Gasoil.
 app.get('/scrape-gasoil', async (req, res) => {
   try {
-    const response = await axios.get(
-      'https://es.investing.com/commodities/london-gas-oil',
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-        },
-      }
-    );
+    const resultado = await getPrice({
+      key: 'gasoil',
+      ...MARKETS.gasoil
+    });
 
-    const html = response.data;
-    const $ = cheerio.load(html);
-
-    const gasoilTexto = $('[data-test="instrument-price-last"]')
-      .first()
-      .text()
-      .trim();
-
-    const gasoil = parseSpanishNumber(gasoilTexto);
-
-    console.log('========== SCRAPE GASOIL ==========');
-    console.log('TEXTO:', gasoilTexto);
-    console.log('PARSEADO:', gasoil);
-    console.log('===================================');
-
-    res.send({ gasoil });
+    return res.json({
+      gasoil: resultado.valor,
+      textoOriginal: resultado.textoOriginal,
+      cached: resultado.cached,
+      obtenidoEn: resultado.obtenidoEn
+    });
   } catch (error) {
-    console.error('❌ Error al obtener datos de gasoil:', error);
-    res.status(500).send('Error al obtener datos de gasoil');
+    console.error('❌ Error al obtener gasoil:', error);
+
+    return res.status(502).json({
+      error: 'Error al obtener datos de gasoil',
+      detalle: error.message
+    });
   }
 });
 
-// Ruta para scraping de la gasolina
+// Gasolina.
 app.get('/scrape-gasolina', async (req, res) => {
   try {
-    const response = await axios.get(
-      'https://es.investing.com/commodities/gasoline-rbob',
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-        },
-      }
-    );
+    const resultado = await getPrice({
+      key: 'gasolina',
+      ...MARKETS.gasolina
+    });
 
-    const html = response.data;
-    const $ = cheerio.load(html);
-
-    const gasolinaTexto = $('[data-test="instrument-price-last"]')
-      .first()
-      .text()
-      .trim();
-
-    const gasolina = parseSpanishNumber(gasolinaTexto);
-
-    console.log('========== SCRAPE GASOLINA ==========');
-    console.log('TEXTO:', gasolinaTexto);
-    console.log('PARSEADO:', gasolina);
-    console.log('=====================================');
-
-    res.send({ gasolina });
+    return res.json({
+      gasolina: resultado.valor,
+      textoOriginal: resultado.textoOriginal,
+      cached: resultado.cached,
+      obtenidoEn: resultado.obtenidoEn
+    });
   } catch (error) {
-    console.error('❌ Error al obtener datos de gasolina:', error);
-    res.status(500).send('Error al obtener datos de gasolina');
+    console.error('❌ Error al obtener gasolina:', error);
+
+    return res.status(502).json({
+      error: 'Error al obtener datos de gasolina',
+      detalle: error.message
+    });
   }
 });
 
-// Ruta para scraping del tipo de cambio EUR/USD
+// Tipo de cambio EUR/USD.
 app.get('/scrape-tipo-cambio', async (req, res) => {
   try {
-    const response = await axios.get(
-      'https://es.investing.com/currencies/eur-usd',
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-        },
-      }
+    const resultado = await getPrice({
+      key: 'tipoCambio',
+      ...MARKETS.tipoCambio
+    });
+
+    return res.json({
+      tipoCambio: resultado.valor,
+      textoOriginal: resultado.textoOriginal,
+      cached: resultado.cached,
+      obtenidoEn: resultado.obtenidoEn
+    });
+  } catch (error) {
+    console.error(
+      '❌ Error al obtener tipo de cambio:',
+      error
     );
 
-    const html = response.data;
-    const $ = cheerio.load(html);
-
-    const tipoCambioTexto = $('[data-test="instrument-price-last"]')
-      .first()
-      .text()
-      .trim();
-
-    const tipoCambio = parseSpanishNumber(tipoCambioTexto);
-
-    console.log('========== SCRAPE TIPO CAMBIO ==========');
-    console.log('TEXTO:', tipoCambioTexto);
-    console.log('PARSEADO:', tipoCambio);
-    console.log('========================================');
-
-    res.send({ tipoCambio });
-  } catch (error) {
-    console.error('❌ Error al obtener el tipo de cambio:', error);
-    res.status(500).send('Error al obtener el tipo de cambio');
+    return res.status(502).json({
+      error: 'Error al obtener el tipo de cambio',
+      detalle: error.message
+    });
   }
 });
 
+/**
+ * Endpoint opcional para obtener los tres valores en una sola petición.
+ */
+app.get('/scrape-mercados', async (req, res) => {
+  try {
+    const [gasoil, gasolina, tipoCambio] =
+      await Promise.all([
+        getPrice({
+          key: 'gasoil',
+          ...MARKETS.gasoil
+        }),
+        getPrice({
+          key: 'gasolina',
+          ...MARKETS.gasolina
+        }),
+        getPrice({
+          key: 'tipoCambio',
+          ...MARKETS.tipoCambio
+        })
+      ]);
+
+    return res.json({
+      gasoil: gasoil.valor,
+      gasolina: gasolina.valor,
+      tipoCambio: tipoCambio.valor,
+      cached: {
+        gasoil: gasoil.cached,
+        gasolina: gasolina.cached,
+        tipoCambio: tipoCambio.cached
+      },
+      obtenidoEn: {
+        gasoil: gasoil.obtenidoEn,
+        gasolina: gasolina.obtenidoEn,
+        tipoCambio: tipoCambio.obtenidoEn
+      }
+    });
+  } catch (error) {
+    console.error(
+      '❌ Error al obtener los mercados:',
+      error
+    );
+
+    return res.status(502).json({
+      error: 'Error al obtener los datos de mercado',
+      detalle: error.message
+    });
+  }
+});
 // Crear tablas
 const createTables = async () => {
-  const client = await pool.connect();
+  let client;
 
   try {
-    // Tabla cierre
+    client = await pool.connect();
+
     await client.query(`
       CREATE TABLE IF NOT EXISTS cierre (
         id SERIAL PRIMARY KEY,
@@ -159,7 +415,6 @@ const createTables = async () => {
       );
     `);
 
-    // Tabla informe
     await client.query(`
       CREATE TABLE IF NOT EXISTS informe (
         id SERIAL PRIMARY KEY,
@@ -168,7 +423,6 @@ const createTables = async () => {
       );
     `);
 
-    // Tabla precios_ciudades
     await client.query(`
       CREATE TABLE IF NOT EXISTS precios_ciudades (
         id SERIAL PRIMARY KEY,
@@ -185,13 +439,17 @@ const createTables = async () => {
 
     console.log('✅ Tablas creadas correctamente');
   } catch (error) {
-    console.error('❌ Error al crear las tablas:', error);
+    console.error(
+      '❌ Error al conectar o crear las tablas:',
+      error.message
+    );
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+    }
   }
 };
 
-// Crear tablas al iniciar
 createTables();
 
 // Insertar datos en precios_ciudades
@@ -456,9 +714,30 @@ app.get('/informes', async (req, res) => {
   }
 });
 
-// Iniciar servidor
-const PORT = process.env.PORT || 3000;
+
+const closeBrowser = async () => {
+  if (browserInstance?.isConnected()) {
+    console.log('🛑 Cerrando Chromium...');
+    await browserInstance.close();
+  }
+
+  browserInstance = null;
+};
+
+process.on('SIGTERM', async () => {
+  await closeBrowser();
+  await pool.end();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  await closeBrowser();
+  await pool.end();
+  process.exit(0);
+});
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Servidor corriendo en http://0.0.0.0:${PORT}`);
+  console.log(
+    `🚀 Servidor corriendo en http://0.0.0.0:${PORT}`
+  );
 });
