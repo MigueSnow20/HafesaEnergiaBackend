@@ -1,6 +1,7 @@
-/.git
-/node_modules
-.dockerignore
+node_modules
+npm-debug.log
+.git
+.gitignore
+database.env
 .env
-Dockerfile
-fly.toml
+debug-*.png
