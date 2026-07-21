@@ -143,10 +143,12 @@ const scrapeInvestingPrice = async ({ url, nombre }) => {
       return route.continue();
     });
 
-    const response = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000
-    });
+const response = await page.goto(url, {
+  waitUntil: 'commit',
+  timeout: 60_000
+});
+
+console.log(await page.content());
 
     if (!response) {
       throw new Error(`No se recibió respuesta al abrir ${url}`);
@@ -160,10 +162,10 @@ const scrapeInvestingPrice = async ({ url, nombre }) => {
 
     const priceLocator = page.locator(PRICE_SELECTOR).first();
 
-    await priceLocator.waitFor({
-      state: 'attached',
-      timeout: 15_000
-    });
+await priceLocator.waitFor({
+  state: 'visible',
+  timeout: 60_000
+});
 
     const textoLimpio = (await priceLocator.textContent())?.trim();
 
