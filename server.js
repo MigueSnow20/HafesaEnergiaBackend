@@ -3,6 +3,7 @@ import cors from 'cors';
 import pkg from 'pg';
 import { chromium } from 'playwright';
 import dotenv from 'dotenv';
+import { createV1Proxy } from './lib/v1-proxy.mjs';
 
 const { Pool } = pkg;
 
@@ -21,7 +22,8 @@ const pool = new Pool({
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Market-Refresh-Ms'] }));
+app.use('/api/v1', createV1Proxy(process.env.SPRING_INTERNAL_URL));
 app.use(express.json());
 
 /**
@@ -47,6 +49,10 @@ const parseSpanishNumber = (text) => {
  */
 const PRICE_SELECTOR = '[data-test="instrument-price-last"]';
 const CACHE_DURATION_MS = 60_000;
+const SOURCE_TIMEOUT_MS = Number(process.env.MARKET_TIMEOUT_MS ?? 8000);
+if (!Number.isFinite(SOURCE_TIMEOUT_MS) || SOURCE_TIMEOUT_MS <= 0) {
+  throw new Error('MARKET_TIMEOUT_MS must be positive');
+}
 
 // Una sola instancia de Chromium para toda la aplicación.
 let browserInstance = null;
@@ -55,6 +61,7 @@ let browserLaunchPromise = null;
 // Caché de resultados y peticiones en curso.
 const priceCache = new Map();
 const pendingScrapes = new Map();
+let scrapeQueue = Promise.resolve();
 
 /**
  * Devuelve una instancia compartida de Chromium.
@@ -145,10 +152,8 @@ const scrapeInvestingPrice = async ({ url, nombre }) => {
 
 const response = await page.goto(url, {
   waitUntil: 'commit',
-  timeout: 60_000
+  timeout: SOURCE_TIMEOUT_MS
 });
-
-console.log(await page.content());
 
     if (!response) {
       throw new Error(`No se recibió respuesta al abrir ${url}`);
@@ -164,7 +169,7 @@ console.log(await page.content());
 
 await priceLocator.waitFor({
   state: 'visible',
-  timeout: 60_000
+  timeout: SOURCE_TIMEOUT_MS
 });
 
     const textoLimpio = (await priceLocator.textContent())?.trim();
@@ -225,10 +230,7 @@ const getPrice = async ({ key, url, nombre }) => {
     return pendingScrapes.get(key);
   }
 
-  const scrapingPromise = scrapeInvestingPrice({
-    url,
-    nombre
-  })
+  const scrapingPromise = scrapeQueue.then(() => scrapeInvestingPrice({ url, nombre }))
     .then((result) => {
       priceCache.set(key, {
         result,
@@ -245,6 +247,7 @@ const getPrice = async ({ key, url, nombre }) => {
     });
 
   pendingScrapes.set(key, scrapingPromise);
+  scrapeQueue = scrapingPromise.catch(() => undefined);
 
   return scrapingPromise;
 };
