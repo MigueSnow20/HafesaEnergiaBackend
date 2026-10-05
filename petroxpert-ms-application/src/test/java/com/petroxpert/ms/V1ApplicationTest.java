@@ -47,7 +47,7 @@ class V1ApplicationTest {
                 .andExpect(jsonPath("$[0].sourceStatus").value("PENDING"))
                 .andExpect(jsonPath("$[0].stale").value(true));
         mvc.perform(get("/api/v1/markets/summary")).andExpect(status().isOk())
-                .andExpect(header().string("X-Market-Refresh-Ms", "30000"))
+                .andExpect(header().string("X-Market-Refresh-Ms", "5000"))
                 .andExpect(jsonPath("$.calculationStatus").value("MISSING_INPUTS"));
         mvc.perform(get("/api/v1/markets/BRENT")).andExpect(status().isNotFound());
         var first = mvc.perform(get("/api/v1/markets")).andReturn().getResponse().getContentAsString();

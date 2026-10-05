@@ -15,7 +15,7 @@ FROM mcr.microsoft.com/playwright:v1.61.1-noble
 WORKDIR /app
 ENV NODE_ENV=production JAVA_HOME=/opt/java/openjdk
 ENV PATH="/opt/java/openjdk/bin:${PATH}"
-ENV MARKET_REFRESH=30s
+ENV MARKET_REFRESH=5s MARKET_STALE_AFTER=20s
 COPY --from=java-runtime /opt/java/openjdk /opt/java/openjdk
 COPY package.json package-lock.json ./
 RUN npm ci

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const publicPort = Number(process.env.PORT ?? 3000);
-const springPort = Number(process.env.SPRING_PORT ?? 8080);
+const springPort = Number(process.env.SPRING_PORT ?? 8081);
 const sourceTimeoutMs = Number(process.env.MARKET_TIMEOUT_MS ?? 8000);
 if (![publicPort, springPort].every(port => Number.isInteger(port) && port > 0 && port <= 65535)
     || publicPort === springPort) {
@@ -58,6 +58,6 @@ start('legacy', process.execPath, ['server.js'], {
 start('Spring', process.env.JAVA_BIN ?? 'java', [
   '-XX:MaxRAMPercentage=25', '-jar', jar,
   '--spring.profiles.active=v1', '--server.address=127.0.0.1', `--server.port=${springPort}`,
-  '--petroxpert.market.provider=legacy', '--petroxpert.market.stale-after=90s',
+  '--petroxpert.market.provider=legacy',
   `--petroxpert.market.source-timeout=${sourceTimeoutMs * 6 + 5000}ms`, `--legacy.base-url=${legacyOrigin}`,
 ], process.env);

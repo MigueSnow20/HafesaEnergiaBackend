@@ -1,3 +1,36 @@
+# Actualización prioritaria: fuente Ironbeam — 2026-10-05
+
+El contenido de 2026-10-01 debajo es histórico; su descripción de scraping Investing queda superseded.
+
+El backend editable ahora lee el snapshot agregado del Spring nuevo mediante:
+PETROXPERT_MARKET_API_URL + PETROXPERT_MARKET_API_TOKEN (secret externo compartido).
+Ruta upstream: GET /internal/legacy-markets. Timeout: PETROXPERT_MARKET_API_TIMEOUT_MS (5000 ms).
+Conserva /scrape-gasoil, /scrape-gasolina, /scrape-tipo-cambio y /scrape-mercados con su JSON.
+Node no abre Investing ni usa fallback. server.js ya no importa ni ejecuta Playwright.
+Scripts diagnose-investing* y proveedores Java Investing anteriores son DEPRECATED,
+exclusivamente históricos/manuales; npm start configura provider=legacy, no los ejecuta.
+
+El Vue activo usa /api/v1/markets/summary. Su Spring de compatibilidad se mantiene para cálculos
+sin modificar fórmulas ni persistencia; ahora adquiere los mismos Last desde /scrape-mercados.
+SPRING_PORT por defecto pasa a 8081 para convivir localmente con Spring nuevo en 8080.
+SPRING_INTERNAL_URL continúa apuntando a ese Spring de compatibilidad en loopback.
+CORS: configurar LEGACY_ALLOWED_ORIGINS explícitos (origen Vercel y dominios autorizados reales).
+La variable MARKET_TIMEOUT_MS histórica ya no controla Investing en Node.
+M6E.Z26 es un futuro Micro EUR/USD provisional, no spot; no se certifican unidades ni escala.
+
+Configuración de ejemplo sin secretos: .env.example (no se carga automáticamente).
+Variables existentes de database.env siguen cargándose; no se modificaron credenciales.
+Validación local: siete tests Node PASS, frontend build PASS, Chrome con tres Last reales
+1393 / 3.2759 / 1.1247 y fórmulas originales sin diferencias.
+Cierres/primas/informe se probaron con datos sintéticos en PostgreSQL local aislado:
+la conexión PostgreSQL Fly configurada terminó inesperadamente y no se certificó.
+Sin push ni despliegue.
+
+Documentación canónica del puente y launcher local:
+C:/Users/migue/Desktop/PetroXpert/PetroXpertBackend/docs/legacy-ironbeam-bridge.md
+C:/Users/migue/Desktop/PetroXpert/PetroXpertBackend/scripts/StartLegacyIronbeamBridgeLocal.ps1
+
+---
 # Integración de la V1 — 2026-10-01
 
 Fuente: `C:/Users/migue/Desktop/PetroXpert/PetroXpertBackend`, no `_reference`.
