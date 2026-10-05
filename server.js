@@ -1,10 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import pkg from 'pg';
-import { createMarketClient } from './lib/market-client.mjs';
-import { installMarketRoutes } from './lib/market-routes.mjs';
+import { chromium } from 'playwright';
 import dotenv from 'dotenv';
-import { createV1Proxy } from './lib/v1-proxy.mjs';
 
 const { Pool } = pkg;
 
@@ -23,21 +21,380 @@ const pool = new Pool({
 });
 
 // Middleware
-const allowedOrigins = (process.env.LEGACY_ALLOWED_ORIGINS ?? '').split(',').map(value => value.trim()).filter(Boolean);
-if (allowedOrigins.includes('*')) throw new Error('LEGACY_ALLOWED_ORIGINS requires explicit origins');
-app.use(cors({ origin: allowedOrigins, exposedHeaders: ['X-Market-Refresh-Ms'] }));
-app.use('/api/v1', createV1Proxy(process.env.SPRING_INTERNAL_URL));
+app.use(cors());
 app.use(express.json());
 
-const readMarkets = createMarketClient({
-  baseUrl: process.env.PETROXPERT_MARKET_API_URL,
-  token: process.env.PETROXPERT_MARKET_API_TOKEN,
-  timeoutMs: Number(process.env.PETROXPERT_MARKET_API_TIMEOUT_MS ?? 5000),
-});
-installMarketRoutes(app, readMarkets);
+/**
+ * Convierte números españoles:
+ * 1.234,56 -> 1234.56
+ * 712,50   -> 712.50
+ */
+const parseSpanishNumber = (text) => {
+  if (!text || typeof text !== 'string') {
+    return Number.NaN;
+  }
 
+  return Number.parseFloat(
+    text
+      .trim()
+      .replace(/\./g, '')
+      .replace(',', '.')
+  );
+};
+
+/**
+ * Configuración del scraping.
+ */
+const PRICE_SELECTOR = '[data-test="instrument-price-last"]';
+const CACHE_DURATION_MS = 60_000;
+
+// Una sola instancia de Chromium para toda la aplicación.
+let browserInstance = null;
+let browserLaunchPromise = null;
+
+// Caché de resultados y peticiones en curso.
+const priceCache = new Map();
+const pendingScrapes = new Map();
+
+/**
+ * Devuelve una instancia compartida de Chromium.
+ *
+ * browserLaunchPromise evita que tres llamadas simultáneas
+ * inicien tres navegadores durante el primer arranque.
+ */
+const getBrowser = async () => {
+  if (browserInstance?.isConnected()) {
+    return browserInstance;
+  }
+
+  if (!browserLaunchPromise) {
+    console.log('🚀 Iniciando Chromium compartido...');
+
+    browserLaunchPromise = chromium
+      .launch({
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage'
+        ]
+      })
+      .then((browser) => {
+        browserInstance = browser;
+
+        browser.on('disconnected', () => {
+          console.warn('⚠️ Chromium se ha desconectado');
+          browserInstance = null;
+        });
+
+        return browser;
+      })
+      .finally(() => {
+        browserLaunchPromise = null;
+      });
+  }
+
+  return browserLaunchPromise;
+};
+
+/**
+ * Obtiene un precio desde Investing.com.
+ *
+ * El navegador se mantiene abierto. Solo se cierra el contexto
+ * utilizado por esta petición.
+ */
+const scrapeInvestingPrice = async ({ url, nombre }) => {
+  const browser = await getBrowser();
+  let context;
+
+  const startedAt = Date.now();
+
+  try {
+    console.log(`🔄 Consultando ${nombre}: ${url}`);
+
+    context = await browser.newContext({
+      locale: 'es-ES',
+      timezoneId: 'Europe/Madrid',
+      viewport: {
+        width: 1280,
+        height: 720
+      },
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+        'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+        'Chrome/138.0.0.0 Safari/537.36'
+    });
+
+    const page = await context.newPage();
+
+    // Evita descargar recursos pesados que no son necesarios
+    // para localizar el precio.
+    await page.route('**/*', async (route) => {
+      const resourceType = route.request().resourceType();
+
+      if (
+        resourceType === 'image' ||
+        resourceType === 'media' ||
+        resourceType === 'font'
+      ) {
+        return route.abort();
+      }
+
+      return route.continue();
+    });
+
+const response = await page.goto(url, {
+  waitUntil: 'commit',
+  timeout: 60_000
+});
+
+console.log(await page.content());
+
+    if (!response) {
+      throw new Error(`No se recibió respuesta al abrir ${url}`);
+    }
+
+    if (response.status() >= 400) {
+      throw new Error(
+        `Investing.com respondió con HTTP ${response.status()}`
+      );
+    }
+
+    const priceLocator = page.locator(PRICE_SELECTOR).first();
+
+await priceLocator.waitFor({
+  state: 'visible',
+  timeout: 60_000
+});
+
+    const textoLimpio = (await priceLocator.textContent())?.trim();
+
+    if (!textoLimpio) {
+      throw new Error(
+        `No se encontró el valor de ${nombre}`
+      );
+    }
+
+    const valor = parseSpanishNumber(textoLimpio);
+
+    if (!Number.isFinite(valor)) {
+      throw new Error(
+        `No se pudo convertir el valor "${textoLimpio}"`
+      );
+    }
+
+    console.log(
+      `✅ ${nombre}: ${valor} en ${Date.now() - startedAt} ms`
+    );
+
+    return {
+      valor,
+      textoOriginal: textoLimpio,
+      obtenidoEn: new Date().toISOString()
+    };
+  } finally {
+    if (context) {
+      await context.close();
+    }
+  }
+};
+
+/**
+ * Devuelve el precio desde caché o realiza el scraping.
+ *
+ * También reutiliza una petición que ya se encuentre en curso
+ * para evitar dos scrapings simultáneos del mismo producto.
+ */
+const getPrice = async ({ key, url, nombre }) => {
+  const cached = priceCache.get(key);
+
+  if (
+    cached &&
+    Date.now() - cached.timestamp < CACHE_DURATION_MS
+  ) {
+    console.log(`⚡ Caché utilizada para ${nombre}`);
+
+    return {
+      ...cached.result,
+      cached: true
+    };
+  }
+
+  if (pendingScrapes.has(key)) {
+    console.log(`⏳ Reutilizando petición en curso para ${nombre}`);
+    return pendingScrapes.get(key);
+  }
+
+  const scrapingPromise = scrapeInvestingPrice({
+    url,
+    nombre
+  })
+    .then((result) => {
+      priceCache.set(key, {
+        result,
+        timestamp: Date.now()
+      });
+
+      return {
+        ...result,
+        cached: false
+      };
+    })
+    .finally(() => {
+      pendingScrapes.delete(key);
+    });
+
+  pendingScrapes.set(key, scrapingPromise);
+
+  return scrapingPromise;
+};
+
+// Configuración centralizada de mercados.
+const MARKETS = {
+  gasoil: {
+    url: 'https://es.investing.com/commodities/london-gas-oil',
+    nombre: 'gasoil'
+  },
+  gasolina: {
+    url: 'https://es.investing.com/commodities/gasoline-rbob',
+    nombre: 'gasolina'
+  },
+  tipoCambio: {
+    url: 'https://es.investing.com/currencies/eur-usd',
+    nombre: 'tipo de cambio'
+  }
+};
+
+// Comprobación básica.
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'Backend Hafesa Energia funcionando' });
+  res.json({
+    status: 'ok',
+    message: 'Backend Hafesa Energía funcionando'
+  });
+});
+
+// Gasoil.
+app.get('/scrape-gasoil', async (req, res) => {
+  try {
+    const resultado = await getPrice({
+      key: 'gasoil',
+      ...MARKETS.gasoil
+    });
+
+    return res.json({
+      gasoil: resultado.valor,
+      textoOriginal: resultado.textoOriginal,
+      cached: resultado.cached,
+      obtenidoEn: resultado.obtenidoEn
+    });
+  } catch (error) {
+    console.error('❌ Error al obtener gasoil:', error);
+
+    return res.status(502).json({
+      error: 'Error al obtener datos de gasoil',
+      detalle: error.message
+    });
+  }
+});
+
+// Gasolina.
+app.get('/scrape-gasolina', async (req, res) => {
+  try {
+    const resultado = await getPrice({
+      key: 'gasolina',
+      ...MARKETS.gasolina
+    });
+
+    return res.json({
+      gasolina: resultado.valor,
+      textoOriginal: resultado.textoOriginal,
+      cached: resultado.cached,
+      obtenidoEn: resultado.obtenidoEn
+    });
+  } catch (error) {
+    console.error('❌ Error al obtener gasolina:', error);
+
+    return res.status(502).json({
+      error: 'Error al obtener datos de gasolina',
+      detalle: error.message
+    });
+  }
+});
+
+// Tipo de cambio EUR/USD.
+app.get('/scrape-tipo-cambio', async (req, res) => {
+  try {
+    const resultado = await getPrice({
+      key: 'tipoCambio',
+      ...MARKETS.tipoCambio
+    });
+
+    return res.json({
+      tipoCambio: resultado.valor,
+      textoOriginal: resultado.textoOriginal,
+      cached: resultado.cached,
+      obtenidoEn: resultado.obtenidoEn
+    });
+  } catch (error) {
+    console.error(
+      '❌ Error al obtener tipo de cambio:',
+      error
+    );
+
+    return res.status(502).json({
+      error: 'Error al obtener el tipo de cambio',
+      detalle: error.message
+    });
+  }
+});
+
+/**
+ * Endpoint opcional para obtener los tres valores en una sola petición.
+ */
+app.get('/scrape-mercados', async (req, res) => {
+  try {
+    const [gasoil, gasolina, tipoCambio] =
+      await Promise.all([
+        getPrice({
+          key: 'gasoil',
+          ...MARKETS.gasoil
+        }),
+        getPrice({
+          key: 'gasolina',
+          ...MARKETS.gasolina
+        }),
+        getPrice({
+          key: 'tipoCambio',
+          ...MARKETS.tipoCambio
+        })
+      ]);
+
+    return res.json({
+      gasoil: gasoil.valor,
+      gasolina: gasolina.valor,
+      tipoCambio: tipoCambio.valor,
+      cached: {
+        gasoil: gasoil.cached,
+        gasolina: gasolina.cached,
+        tipoCambio: tipoCambio.cached
+      },
+      obtenidoEn: {
+        gasoil: gasoil.obtenidoEn,
+        gasolina: gasolina.obtenidoEn,
+        tipoCambio: tipoCambio.obtenidoEn
+      }
+    });
+  } catch (error) {
+    console.error(
+      '❌ Error al obtener los mercados:',
+      error
+    );
+
+    return res.status(502).json({
+      error: 'Error al obtener los datos de mercado',
+      detalle: error.message
+    });
+  }
 });
 // Crear tablas
 const createTables = async () => {
@@ -360,12 +717,23 @@ app.get('/informes', async (req, res) => {
 });
 
 
+const closeBrowser = async () => {
+  if (browserInstance?.isConnected()) {
+    console.log('🛑 Cerrando Chromium...');
+    await browserInstance.close();
+  }
+
+  browserInstance = null;
+};
+
 process.on('SIGTERM', async () => {
+  await closeBrowser();
   await pool.end();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
+  await closeBrowser();
   await pool.end();
   process.exit(0);
 });

@@ -5,10 +5,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node scripts/start-services.mjs",
-    "start:legacy": "node server.js",
-    "test": "node --test test/*.test.mjs",
-    "check": "node --check server.js && node --check scripts/start-services.mjs && node --check lib/v1-proxy.mjs"
+    "start": "node server.js"
   },
   "engines": {
     "node": ">=20 <23"

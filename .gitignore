@@ -1,9 +1,0 @@
-node_modules/
-**/target/
-*.log
-.env
-.env.*
-database.env
-.idea/
-
-!.env.example
