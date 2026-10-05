@@ -4,3 +4,6 @@ npm-debug.log
 .gitignore
 database.env
 .env
+.env.*
+**/target
+*.log
